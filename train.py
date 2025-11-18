@@ -14,17 +14,39 @@ from model.penmot_model import PENMOT
 from model.losses import CombinedTrackingLoss
 
 
-def create_ground_truth_assignment(current_ids, previous_ids, device):
+def compute_iou(box1, box2):
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union = area1 + area2 - inter
+
+    return inter / (union + 1e-8)
+
+
+def create_ground_truth_assignment(current_boxes, current_ids, previous_boxes, previous_ids, device):
     if len(previous_ids) == 0 or len(current_ids) == 0:
         return torch.zeros((len(current_ids), max(1, len(previous_ids))), device=device)
 
     gt_assignment = torch.zeros((len(current_ids), len(previous_ids)), device=device)
 
-    for i, curr_id in enumerate(current_ids):
-        for j, prev_id in enumerate(previous_ids):
+    current_ids_list = current_ids.tolist() if torch.is_tensor(current_ids) else current_ids
+    previous_ids_list = previous_ids.tolist() if torch.is_tensor(previous_ids) else previous_ids
+
+    current_boxes_np = current_boxes.cpu().numpy() if torch.is_tensor(current_boxes) else current_boxes
+    previous_boxes_np = previous_boxes.cpu().numpy() if torch.is_tensor(previous_boxes) else previous_boxes
+
+    for i, curr_id in enumerate(current_ids_list):
+        for j, prev_id in enumerate(previous_ids_list):
             if curr_id == prev_id:
-                gt_assignment[i, j] = 1.0
-                break
+                iou = compute_iou(current_boxes_np[i], previous_boxes_np[j])
+                if iou > 0.3:
+                    gt_assignment[i, j] = 1.0
+                    break
 
     return gt_assignment
 
@@ -36,7 +58,7 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch):
     loss_components = {'assignment': 0, 'contrastive': 0, 'consistency': 0}
     num_batches = 0
 
-    sequence_tracks = {}
+    sequence_history = {}
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
 
@@ -45,12 +67,12 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch):
             continue
 
         seq_name = metadata['sequence']
-        frame_id = metadata['frame_id']
 
-        if seq_name not in sequence_tracks:
-            sequence_tracks[seq_name] = {
-                'track_manager': model.track_manager,
-                'previous_ids': []
+        if seq_name not in sequence_history:
+            sequence_history[seq_name] = {
+                'prev_boxes': None,
+                'prev_detections': None,
+                'prev_ids': None
             }
 
         img = img.to(device)
@@ -58,42 +80,60 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch):
 
         detection_features = model.extract_detection_features(img, boxes)
 
-        previous_ids = sequence_tracks[seq_name]['previous_ids']
-
-        if len(previous_ids) == 0:
-            for i in range(len(boxes)):
-                box = boxes[i].detach().cpu().numpy()
-                appearance = detection_features[i].detach().cpu().numpy()
-                track_id = model.track_manager.init_track(box, appearance)
-
-            sequence_tracks[seq_name]['previous_ids'] = ids.tolist()
+        if len(detection_features) == 0:
             continue
 
-        track_features, active_track_ids = model.extract_track_features()
+        prev_data = sequence_history[seq_name]
 
-        if len(track_features) == 0:
-            sequence_tracks[seq_name]['previous_ids'] = ids.tolist()
+        if prev_data['prev_detections'] is None:
+            sequence_history[seq_name]['prev_boxes'] = boxes.detach()
+            sequence_history[seq_name]['prev_detections'] = detection_features.detach()
+            sequence_history[seq_name]['prev_ids'] = ids
             continue
 
-        pred_assignment = model(detection_features, track_features)
+        prev_features = prev_data['prev_detections']
+        prev_ids = prev_data['prev_ids']
+        prev_boxes = prev_data['prev_boxes']
+
+        if len(prev_features) == 0:
+            sequence_history[seq_name]['prev_boxes'] = boxes.detach()
+            sequence_history[seq_name]['prev_detections'] = detection_features.detach()
+            sequence_history[seq_name]['prev_ids'] = ids
+            continue
+
+        det_proj = model.detection_projection(detection_features)
+        track_proj = model.track_projection(prev_features)
+
+        det_out = model.detection_transformer(det_proj, track_proj)
+        track_out = model.track_transformer(track_proj, det_proj)
+
+        cost_matrix = -torch.mm(det_out, track_out.t())
+
+        pred_assignment = model.matcher(cost_matrix)
 
         gt_assignment = create_ground_truth_assignment(
-            ids.tolist(),
-            active_track_ids,
-            device
+            boxes, ids, prev_boxes, prev_ids, device
         )
 
         if pred_assignment.shape != gt_assignment.shape:
-            sequence_tracks[seq_name]['previous_ids'] = ids.tolist()
+            sequence_history[seq_name]['prev_boxes'] = boxes.detach()
+            sequence_history[seq_name]['prev_detections'] = detection_features.detach()
+            sequence_history[seq_name]['prev_ids'] = ids
+            continue
+
+        if gt_assignment.sum() == 0:
+            sequence_history[seq_name]['prev_boxes'] = boxes.detach()
+            sequence_history[seq_name]['prev_detections'] = detection_features.detach()
+            sequence_history[seq_name]['prev_ids'] = ids
             continue
 
         loss, loss_dict = criterion(
             pred_assignment,
             gt_assignment,
             detection_features,
-            track_features,
-            torch.tensor(ids.tolist(), device=device),
-            torch.tensor(active_track_ids, device=device)
+            prev_features,
+            ids.to(device),
+            prev_ids.to(device)
         )
 
         optimizer.zero_grad()
@@ -101,15 +141,9 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch):
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
-        matched_indices = (pred_assignment > 0.5).nonzero(as_tuple=False)
-        for det_idx, track_idx in matched_indices:
-            if track_idx < len(active_track_ids):
-                track_id = active_track_ids[track_idx.item()]
-                box = boxes[det_idx].detach().cpu().numpy()
-                appearance = detection_features[det_idx].detach().cpu().numpy()
-                model.track_manager.update_track(track_id, box, appearance)
-
-        sequence_tracks[seq_name]['previous_ids'] = ids.tolist()
+        sequence_history[seq_name]['prev_boxes'] = boxes.detach()
+        sequence_history[seq_name]['prev_detections'] = detection_features.detach()
+        sequence_history[seq_name]['prev_ids'] = ids
 
         total_loss += loss.item()
         loss_components['assignment'] += loss_dict['assignment_loss']
@@ -117,11 +151,12 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch):
         loss_components['consistency'] += loss_dict['consistency_loss']
         num_batches += 1
 
-        pbar.set_postfix({
-            'loss': f"{loss.item():.4f}",
-            'assign': f"{loss_dict['assignment_loss']:.4f}",
-            'contrast': f"{loss_dict['contrastive_loss']:.4f}"
-        })
+        if num_batches % 10 == 0:
+            pbar.set_postfix({
+                'loss': f"{loss.item():.4f}",
+                'assign': f"{loss_dict['assignment_loss']:.4f}",
+                'batches': num_batches
+            })
 
     if num_batches == 0:
         return 0, loss_components
@@ -139,7 +174,7 @@ def validate(model, val_loader, criterion, device):
     total_loss = 0
     num_batches = 0
 
-    sequence_tracks = {}
+    sequence_history = {}
 
     with torch.no_grad():
         for img, boxes, ids, visibility, metadata in tqdm(val_loader, desc="Validation"):
@@ -148,9 +183,11 @@ def validate(model, val_loader, criterion, device):
 
             seq_name = metadata['sequence']
 
-            if seq_name not in sequence_tracks:
-                sequence_tracks[seq_name] = {
-                    'previous_ids': []
+            if seq_name not in sequence_history:
+                sequence_history[seq_name] = {
+                    'prev_boxes': None,
+                    'prev_detections': None,
+                    'prev_ids': None
                 }
 
             img = img.to(device)
@@ -158,36 +195,65 @@ def validate(model, val_loader, criterion, device):
 
             detection_features = model.extract_detection_features(img, boxes)
 
-            previous_ids = sequence_tracks[seq_name]['previous_ids']
-
-            if len(previous_ids) == 0:
-                sequence_tracks[seq_name]['previous_ids'] = ids.tolist()
+            if len(detection_features) == 0:
                 continue
 
-            track_features, active_track_ids = model.extract_track_features()
+            prev_data = sequence_history[seq_name]
 
-            if len(track_features) == 0:
+            if prev_data['prev_detections'] is None:
+                sequence_history[seq_name]['prev_boxes'] = boxes
+                sequence_history[seq_name]['prev_detections'] = detection_features
+                sequence_history[seq_name]['prev_ids'] = ids
                 continue
 
-            pred_assignment = model(detection_features, track_features)
+            prev_features = prev_data['prev_detections']
+            prev_ids = prev_data['prev_ids']
+            prev_boxes = prev_data['prev_boxes']
+
+            if len(prev_features) == 0:
+                sequence_history[seq_name]['prev_boxes'] = boxes
+                sequence_history[seq_name]['prev_detections'] = detection_features
+                sequence_history[seq_name]['prev_ids'] = ids
+                continue
+
+            det_proj = model.detection_projection(detection_features)
+            track_proj = model.track_projection(prev_features)
+
+            det_out = model.detection_transformer(det_proj, track_proj)
+            track_out = model.track_transformer(track_proj, det_proj)
+
+            cost_matrix = -torch.mm(det_out, track_out.t())
+
+            pred_assignment = model.matcher(cost_matrix)
 
             gt_assignment = create_ground_truth_assignment(
-                ids.tolist(),
-                active_track_ids,
-                device
+                boxes, ids, prev_boxes, prev_ids, device
             )
 
             if pred_assignment.shape != gt_assignment.shape:
+                sequence_history[seq_name]['prev_boxes'] = boxes
+                sequence_history[seq_name]['prev_detections'] = detection_features
+                sequence_history[seq_name]['prev_ids'] = ids
+                continue
+
+            if gt_assignment.sum() == 0:
+                sequence_history[seq_name]['prev_boxes'] = boxes
+                sequence_history[seq_name]['prev_detections'] = detection_features
+                sequence_history[seq_name]['prev_ids'] = ids
                 continue
 
             loss, _ = criterion(
                 pred_assignment,
                 gt_assignment,
                 detection_features,
-                track_features,
-                torch.tensor(ids.tolist(), device=device),
-                torch.tensor(active_track_ids, device=device)
+                prev_features,
+                ids.to(device),
+                prev_ids.to(device)
             )
+
+            sequence_history[seq_name]['prev_boxes'] = boxes
+            sequence_history[seq_name]['prev_detections'] = detection_features
+            sequence_history[seq_name]['prev_ids'] = ids
 
             total_loss += loss.item()
             num_batches += 1
@@ -220,15 +286,12 @@ def main():
 
     if MOT17_PATH is None:
         print(f"Error: MOT17 dataset not found")
-        print(f"Checked paths:")
-        for path in possible_paths:
-            print(f"  - {os.path.normpath(os.path.abspath(path))}")
         return
 
     print("Loading dataset...")
     train_loader, val_loader = create_mot17_dataloaders(
         MOT17_PATH,
-        batch_size=32,
+        batch_size=1,
         num_workers=0
     )
 
@@ -239,7 +302,7 @@ def main():
         transformer_dim=512,
         num_heads=8,
         num_layers=2,
-        sinkhorn_iters=5,
+        sinkhorn_iters=20,
         sinkhorn_tau=0.1,
         freeze_detection_encoder=True
     ).to(device)
@@ -253,7 +316,7 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
 
-    writer = SummaryWriter(log_dir='runs/penmot_training')
+    writer = SummaryWriter(log_dir='runs/penmot_sinkhorn_training')
 
     num_epochs = 10
     best_val_loss = float('inf')
@@ -261,7 +324,7 @@ def main():
     output_dir = os.path.join(project_root, 'outputs', 'checkpoints')
     os.makedirs(output_dir, exist_ok=True)
 
-    print("\nStarting training...")
+    print("\nStarting training with Sinkhorn...")
     for epoch in range(1, num_epochs + 1):
         print(f"\n{'=' * 60}")
         print(f"Epoch {epoch}/{num_epochs}")
@@ -288,9 +351,9 @@ def main():
         print(f"    - Consistency: {train_components['consistency']:.4f}")
         print(f"  Val Loss: {val_loss:.4f}")
 
-        if val_loss < best_val_loss:
+        if val_loss < best_val_loss and val_loss > 0:
             best_val_loss = val_loss
-            checkpoint_path = os.path.join(output_dir, 'penmot_best.pth')
+            checkpoint_path = os.path.join(output_dir, 'penmot_sinkhorn_best.pth')
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
