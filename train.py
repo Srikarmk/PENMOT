@@ -318,7 +318,7 @@ def main():
 
     writer = SummaryWriter(log_dir='runs/penmot_sinkhorn_training')
 
-    num_epochs = 40
+    num_epochs = 30
     best_val_loss = float('inf')
 
     output_dir = os.path.join(project_root, 'outputs', 'checkpoints')
