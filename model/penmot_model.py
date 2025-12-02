@@ -430,8 +430,14 @@ class PENMOT(nn.Module):
         )
 
         self.matcher = SinkhornMatcher(
-            n_iters=20,
-            tau=0.05,
+            n_iters=sinkhorn_iters,
+            tau=sinkhorn_tau,
+            hard_assignment=False
+        )
+
+        self.inference_matcher = SinkhornMatcher(
+            n_iters=sinkhorn_iters,
+            tau=sinkhorn_tau,
             hard_assignment=True
         )
 
@@ -458,7 +464,7 @@ class PENMOT(nn.Module):
     def extract_track_features(self, track_ids=None):
         return self.track_manager.get_track_features(track_ids)
 
-    def forward(self, detection_features, track_features):
+    def forward(self, detection_features, track_features, use_hard_assignment=None):
         if len(detection_features) == 0 or len(track_features) == 0:
             return torch.zeros((len(detection_features), len(track_features)))
 
@@ -470,7 +476,11 @@ class PENMOT(nn.Module):
 
         cost_matrix = -torch.mm(det_out, track_out.t())
 
-        assignment = self.matcher(cost_matrix)
+        if use_hard_assignment is None:
+            use_hard_assignment = not self.training
+
+        matcher = self.inference_matcher if use_hard_assignment else self.matcher
+        assignment = matcher(cost_matrix)
 
         return assignment
 
@@ -502,8 +512,6 @@ class PENMOT(nn.Module):
         return new_track_ids
 
     def track_frame(self, img, boxes):
-        print(f"[TRACK_FRAME] Called with {len(boxes)} boxes")
-
         if len(boxes) == 0:
             self.track_manager.predict_tracks()
             return [], []
@@ -523,12 +531,8 @@ class PENMOT(nn.Module):
         valid_boxes_np = valid_boxes.detach().cpu().numpy()
 
         detection_features = self.extract_detection_features(img, valid_boxes)
-        print(f"[TRACK_FRAME] Extracted {len(detection_features)} detection features")
-
-        print(f"[TRACK_FRAME] Total tracks in manager: {len(self.track_manager.tracks)}")
 
         if len(self.track_manager.tracks) == 0:
-            print(f"[TRACK_FRAME] No existing tracks, creating new ones")
             track_ids = []
             for i in range(len(valid_boxes)):
                 box = valid_boxes_np[i]
@@ -540,10 +544,7 @@ class PENMOT(nn.Module):
         confirmed_tracks = {tid: t for tid, t in self.track_manager.tracks.items()
                             if t.is_confirmed(min_hits=1)}
 
-        print(f"[TRACK_FRAME] Confirmed tracks: {len(confirmed_tracks)}")
-
         if len(confirmed_tracks) == 0:
-            print(f"[TRACK_FRAME] No confirmed tracks, creating new ones")
             track_ids = []
             for i in range(len(valid_boxes)):
                 box = valid_boxes_np[i]
@@ -555,10 +556,7 @@ class PENMOT(nn.Module):
         active_track_ids = list(confirmed_tracks.keys())
         track_features, feature_track_ids = self.extract_track_features(active_track_ids)
 
-        print(f"[TRACK_FRAME] Extracted {len(track_features)} track features from {len(active_track_ids)} tracks")
-
         if len(track_features) == 0:
-            print(f"[TRACK_FRAME] No track features, creating new tracks")
             track_ids = []
             for i in range(len(valid_boxes)):
                 box = valid_boxes_np[i]
@@ -567,13 +565,9 @@ class PENMOT(nn.Module):
                 track_ids.append(track_id)
             return track_ids, detection_features
 
-        print(f"[TRACK_FRAME] Computing assignment matrix...")
-        assignment = self.forward(detection_features, track_features)
-        print(f"[TRACK_FRAME] Assignment shape: {assignment.shape}")
-        print(f"[TRACK_FRAME] Assignment:\n{assignment}")
+        assignment = self.forward(detection_features, track_features, use_hard_assignment=True)
 
         matches = (assignment > 0.5).nonzero(as_tuple=False)
-        print(f"[TRACK_FRAME] Found {len(matches)} matches")
 
         assigned_track_ids = [-1] * len(valid_boxes)
 
@@ -589,16 +583,12 @@ class PENMOT(nn.Module):
                 appearance = detection_features[det_idx].detach().cpu().numpy()
                 self.track_manager.update_track(track_id, box, appearance)
 
-        print(f"[TRACK_FRAME] Assigned {sum(1 for x in assigned_track_ids if x != -1)} detections to existing tracks")
-
         for det_idx in range(len(valid_boxes)):
             if assigned_track_ids[det_idx] == -1:
                 box = valid_boxes_np[det_idx]
                 appearance = detection_features[det_idx].detach().cpu().numpy()
                 track_id = self.track_manager.init_track(box, appearance)
                 assigned_track_ids[det_idx] = track_id
-
-        print(f"[TRACK_FRAME] Created {sum(1 for x in assigned_track_ids if x > max(feature_track_ids))} new tracks")
 
         self.track_manager.remove_deleted_tracks(max_age=30)
 
