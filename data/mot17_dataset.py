@@ -8,21 +8,22 @@ import torchvision.transforms as T
 
 
 class MOT17Dataset(Dataset):
-    def __init__(self, mot17_root, sequences, min_visibility=0.25, transform=None):
+    def __init__(self, mot17_root, sequences, split='train', min_visibility=0.25, transform=None):
         self.mot17_root = os.path.normpath(os.path.abspath(mot17_root))
         self.sequences = sequences
+        self.split = split  # 'train' or 'test'
         self.min_visibility = min_visibility
         self.transform = transform
 
         self.samples = self._load_annotations()
 
-        print(f"Loaded {len(self.samples)} frames from {len(sequences)} sequences")
+        print(f"Loaded {len(self.samples)} frames from {len(sequences)} sequences ({split} split)")
 
     def _load_annotations(self):
         samples = []
 
         for seq_name in self.sequences:
-            seq_path = os.path.join(self.mot17_root, 'train', seq_name)
+            seq_path = os.path.join(self.mot17_root, self.split, seq_name)
             seq_path = os.path.normpath(seq_path)
             gt_path = os.path.join(seq_path, 'gt', 'gt.txt')
             gt_path = os.path.normpath(gt_path)
@@ -85,6 +86,7 @@ class MOT17Dataset(Dataset):
 
 
 def create_mot17_dataloaders(mot17_root, batch_size=1, num_workers=4):
+    # Split train sequences into train/val
     train_sequences = [
         'MOT17-02-FRCNN', 'MOT17-04-FRCNN', 'MOT17-05-FRCNN',
         'MOT17-09-FRCNN', 'MOT17-10-FRCNN'
@@ -100,8 +102,8 @@ def create_mot17_dataloaders(mot17_root, batch_size=1, num_workers=4):
                     std=[0.229, 0.224, 0.225])
     ])
 
-    train_dataset = MOT17Dataset(mot17_root, train_sequences, transform=transform)
-    val_dataset = MOT17Dataset(mot17_root, val_sequences, transform=transform)
+    train_dataset = MOT17Dataset(mot17_root, train_sequences, split='train', transform=transform)
+    val_dataset = MOT17Dataset(mot17_root, val_sequences, split='train', transform=transform)
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,

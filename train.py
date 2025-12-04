@@ -3,8 +3,10 @@ import os
 import torch
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
+import wandb
 import numpy as np
 from tqdm import tqdm
+from datetime import datetime
 
 project_root = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, project_root)
@@ -172,6 +174,7 @@ def validate(model, val_loader, criterion, device):
     model.eval()
 
     total_loss = 0
+    loss_components = {'assignment': 0, 'contrastive': 0, 'consistency': 0}
     num_batches = 0
 
     sequence_history = {}
@@ -242,7 +245,7 @@ def validate(model, val_loader, criterion, device):
                 sequence_history[seq_name]['prev_ids'] = ids
                 continue
 
-            loss, _ = criterion(
+            loss, loss_dict = criterion(
                 pred_assignment,
                 gt_assignment,
                 detection_features,
@@ -256,12 +259,19 @@ def validate(model, val_loader, criterion, device):
             sequence_history[seq_name]['prev_ids'] = ids
 
             total_loss += loss.item()
+            loss_components['assignment'] += loss_dict['assignment_loss']
+            loss_components['contrastive'] += loss_dict['contrastive_loss']
+            loss_components['consistency'] += loss_dict['consistency_loss']
             num_batches += 1
 
     if num_batches == 0:
-        return 0
+        return 0, loss_components
 
-    return total_loss / num_batches
+    avg_loss = total_loss / num_batches
+    for key in loss_components:
+        loss_components[key] /= num_batches
+
+    return avg_loss, loss_components
 
 
 def main():
@@ -313,16 +323,57 @@ def main():
         w_consistency=0.3
     )
 
-    optimizer = optim.Adam(model.parameters(), lr=1e-4)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+    # AdamW with weight decay for better regularization
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    
+    # Warmup for 3 epochs, then cosine annealing for remaining 27 epochs
+    warmup_scheduler = optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=3)
+    cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=27, eta_min=1e-6)
+    scheduler = optim.lr_scheduler.SequentialLR(
+        optimizer, 
+        schedulers=[warmup_scheduler, cosine_scheduler], 
+        milestones=[3]
+    )
 
+    # Initialize wandb
+    wandb.init(
+        project="penmot",
+        name="sinkhorn_training",
+        config={
+            "optimizer": "AdamW",
+            "learning_rate": 1e-4,
+            "weight_decay": 1e-4,
+            "epochs": 30,
+            "batch_size": 1,
+            "detection_feature_dim": 512,
+            "track_feature_dim": 512,
+            "transformer_dim": 512,
+            "num_heads": 8,
+            "num_layers": 2,
+            "sinkhorn_iters": 20,
+            "sinkhorn_tau": 0.1,
+            "w_assignment": 1.0,
+            "w_contrastive": 0.5,
+            "w_consistency": 0.3,
+            "scheduler": "Warmup+CosineAnnealingLR",
+            "warmup_epochs": 3,
+            "warmup_start_factor": 0.1,
+            "scheduler_T_max": 27,
+            "scheduler_eta_min": 1e-6
+        }
+    )
+
+    # Initialize TensorBoard
     writer = SummaryWriter(log_dir='runs/penmot_sinkhorn_training')
 
-    num_epochs = 30
+    num_epochs = 25
     best_val_loss = float('inf')
 
     output_dir = os.path.join(project_root, 'outputs', 'checkpoints')
     os.makedirs(output_dir, exist_ok=True)
+    
+    # Create timestamp for this training run
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     print("\nStarting training with Sinkhorn...")
     for epoch in range(1, num_epochs + 1):
@@ -334,35 +385,63 @@ def main():
             model, train_loader, criterion, optimizer, device, epoch
         )
 
-        val_loss = validate(model, val_loader, criterion, device)
+        val_loss, val_components = validate(model, val_loader, criterion, device)
 
         scheduler.step()
 
+        # Get current learning rate
+        current_lr = optimizer.param_groups[0]['lr']
+
+        # Log metrics to wandb
+        wandb.log({
+            'epoch': epoch,
+            'train_loss': train_loss,
+            'val_loss': val_loss,
+            'train_assignment_loss': train_components['assignment'],
+            'train_contrastive_loss': train_components['contrastive'],
+            'train_consistency_loss': train_components['consistency'],
+            'val_assignment_loss': val_components['assignment'],
+            'val_contrastive_loss': val_components['contrastive'],
+            'val_consistency_loss': val_components['consistency'],
+            'learning_rate': current_lr
+        })
+
+        # Log metrics to TensorBoard
         writer.add_scalar('Loss/train', train_loss, epoch)
         writer.add_scalar('Loss/val', val_loss, epoch)
         writer.add_scalar('Loss/train_assignment', train_components['assignment'], epoch)
         writer.add_scalar('Loss/train_contrastive', train_components['contrastive'], epoch)
         writer.add_scalar('Loss/train_consistency', train_components['consistency'], epoch)
+        writer.add_scalar('Loss/val_assignment', val_components['assignment'], epoch)
+        writer.add_scalar('Loss/val_contrastive', val_components['contrastive'], epoch)
+        writer.add_scalar('Loss/val_consistency', val_components['consistency'], epoch)
+        writer.add_scalar('Learning_Rate', current_lr, epoch)
 
         print(f"\nEpoch {epoch} Summary:")
+        print(f"  Learning Rate: {current_lr:.6f}")
         print(f"  Train Loss: {train_loss:.4f}")
         print(f"    - Assignment: {train_components['assignment']:.4f}")
         print(f"    - Contrastive: {train_components['contrastive']:.4f}")
         print(f"    - Consistency: {train_components['consistency']:.4f}")
         print(f"  Val Loss: {val_loss:.4f}")
+        print(f"    - Assignment: {val_components['assignment']:.4f}")
+        print(f"    - Contrastive: {val_components['contrastive']:.4f}")
+        print(f"    - Consistency: {val_components['consistency']:.4f}")
 
         if val_loss < best_val_loss and val_loss > 0:
             best_val_loss = val_loss
-            checkpoint_path = os.path.join(output_dir, 'penmot_sinkhorn_best.pth')
+            checkpoint_path = os.path.join(output_dir, f'penmot_sinkhorn_best_{timestamp}.pth')
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_loss': val_loss,
+                'timestamp': timestamp,
             }, checkpoint_path)
             print(f"  Saved best model to {checkpoint_path}")
 
     writer.close()
+    wandb.finish()
     print("\nTraining completed!")
 
 

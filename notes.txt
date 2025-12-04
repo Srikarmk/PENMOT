@@ -1,0 +1,7 @@
+correct dataset splits
+check soft/hard assignments
+understand each loss func
+try - cross attention instead of set Transformer
+
+add timestamp to wandb run names
+log losses separately for val

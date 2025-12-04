@@ -1,0 +1,240 @@
+\documentclass{article}
+
+% if you need to pass options to natbib, use, e.g.:
+%     \PassOptionsToPackage{numbers, compress}{natbib}
+% before loading neurips_2023
+
+% ready for submission
+\usepackage[preprint]{neurips_2023}
+
+% to compile a preprint version, e.g., for submission to arXiv, add add the
+% [preprint] option:
+%     \usepackage[preprint]{neurips_2023}
+% \usepackage[margin=1.25in]{geometry} % Standard margins if neurips style is missing
+% \usepackage{authblk} % For author formatting without neurips style
+
+% to compile a camera-ready version, add the [final] option:
+%     \usepackage[final]{neurips_2023}
+
+% to avoid loading the natbib package, add option nonatbib:
+%    \usepackage[nonatbib]{neurips_2023}
+
+\usepackage[utf8]{inputenc} % allow utf-8 input
+\usepackage[T1]{fontenc}    % use 8-bit T1 fonts
+\usepackage{hyperref}       % hyperlinks
+\usepackage{url}            % simple URL typesetting
+\usepackage{booktabs}       % professional-quality tables
+\usepackage{amsfonts}       % blackboard math symbols
+\usepackage{nicefrac}       % compact symbols for 1/2, etc.
+\usepackage{microtype}      % microtypography
+\usepackage{xcolor}         % colors
+\usepackage{graphicx}       % graphics
+\usepackage{amsmath}        % math
+\usepackage{amssymb}        % symbols
+
+\title{PENMOT: Permutation-Equivariant Networks for Multi-Object Tracking \\ \large Milestone 2 Report}
+
+% The \author macro works with any number of authors. There are two commands
+% used to separate the names and addresses of multiple authors: \And and \AND.
+%
+% Using \And between authors leaves it to LaTeX to determine where to break
+% the lines. Using \AND forces a line break at that point. So, if LaTeX puts
+% 3 of 4 authors names on the first line, and the last on the second line,
+% try using \AND instead of \And before the third author name.
+
+\author{%
+  Kameswara Sai Srikar Manda \\
+  Northeastern University\\
+  \texttt{manda.k@northeastern.edu} \\
+  \And
+  Chainathan Santhanam Sudhakar \\
+  Northeastern University\\
+  \texttt{santhanamsudhakar.c@northeastern.edu} \\
+  \And
+  Pranav Kompally \\
+  Northeastern University\\
+  \texttt{kompally.p@northeastern.edu} \\
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+  Multi-object tracking (MOT) is a fundamental computer vision challenge requiring the consistent association of object identities across video frames. Traditional approaches relying on the Hungarian algorithm suffer from two limitations: non-differentiability, which precludes end-to-end training, and a lack of permutation equivariance, which ignores the inherent symmetry of object sets. In this milestone, we present the complete implementation of PENMOT (Permutation-Equivariant Networks for Multi-Object Tracking). Our architecture integrates a ResNet-50 appearance encoder, an LSTM-based motion encoder, and a permutation-equivariant Set Transformer that learns object associations via self- and cross-attention mechanisms. We replace the Hungarian algorithm with the differentiable Sinkhorn algorithm, enabling end-to-end learning of the assignment problem. We evaluate our method on the MOT17 dataset. A Multi-Object Tracking Accuracy (MOTA) of 28.12\% and high ID switching rate (1518 switches) highlight the current challenge of maintaining long-term identity consistency, which remains the focus for the final phase of this project.
+\end{abstract}
+
+\section{Introduction}
+
+The goal of Multi-Object Tracking (MOT) is to detect objects in a video sequence and assign a unique, consistent identity to each object over time. This problem is central to applications ranging from autonomous driving to surveillance and robotics. The current state-of-the-art paradigm, tracking-by-detection, simplifies the problem into two steps: (1) detecting objects in each frame independently, and (2) associating these detections with existing tracks from previous frames.
+
+While detection methods have advanced rapidly with deep learning, the association step often relies on heuristic algorithms like the Hungarian algorithm. These algorithms match detections to tracks based on hand-crafted cost matrices (e.g., Intersection over Union or cosine distance). However, this approach has significant drawbacks. First, the Hungarian algorithm is non-differentiable, acting as a barrier that prevents gradients from flowing back into the feature extraction networks. This forces the system to be trained in stages rather than end-to-end. Second, while the Hungarian algorithm itself is order-invariant, standard neural networks (like MLPs or RNNs) used for feature processing prior to matching often assume a fixed input order, violating the natural permutation symmetry of the tracking problem.
+
+To address these limitations, we propose PENMOT. Our method explicitly encodes permutation symmetry into the neural architecture using Set Transformers, which process sets of object features without relying on positional encodings. Furthermore, we utilize the Sinkhorn algorithm—a differentiable approximation of optimal transport—to solve the assignment problem. This allows our entire pipeline, from feature extraction to data association, to be differentiable and learnable. In this report, we detail our full methodology, including the implemented Set Transformer and Sinkhorn matching layers, and present experimental results on the MOT17 dataset.
+
+\section{Related Work}
+
+\textbf{Tracking-by-Detection:} Methods like ByteTrack [1] and FairMOT represent the current state-of-the-art. ByteTrack utilizes a high-performance detector (YOLOX) and associates low-confidence detections to recover occluded objects. However, it relies on the Hungarian algorithm for matching, which is non-learnable. FairMOT attempts to learn appearance features jointly with detection but still uses standard association heuristics.
+
+\textbf{Permutation-Equivariant Networks:} The concept of processing sets with neural networks was formalized by DeepSets and further refined by Set Transformers [2]. These architectures use attention mechanisms to model interactions between elements in a set while guaranteeing that the output permutes in correspondence with the input. Our work applies this theory to the temporal association domain.
+
+\textbf{Differentiable Matching:} The Sinkhorn algorithm provides a differentiable way to solve the linear assignment problem by iteratively normalizing rows and columns of a cost matrix to approach a doubly-stochastic matrix. This has been successfully applied in graph matching (SuperGlue) and now in our work for MOT.
+
+\section{Background}
+
+\textbf{Permutation Equivariance:} A function $f: X^N \rightarrow Y^N$ is permutation-equivariant if for any permutation $\pi$ of the indices $\{1, \dots, N\}$, $f(\pi(x)) = \pi(f(x))$. In the context of tracking, if the list of detected objects is reordered, the resulting assignment probabilities should reorder in the exact same way. This inductive bias significantly reduces the hypothesis space the model must learn, improving data efficiency.
+
+\textbf{Optimal Transport and Sinkhorn:} The assignment problem can be viewed as finding a permutation matrix $P$ that minimizes the cost $\langle C, P \rangle$. The Sinkhorn algorithm approximates this by solving an entropy-regularized version of the problem:
+$$P^* = \mathop{\mathrm{argmin}}_{P \in U(r, c)} \langle C, P \rangle - \frac{1}{\tau} H(P)$$
+where $H(P)$ is the entropy and $\tau$ is a temperature parameter. The solution is obtained by alternating row and column normalizations (Sinkhorn-Knopp iterations), which are fully differentiable operations.
+
+\section{Method}
+
+Our PENMOT architecture consists of three main stages: Feature Extraction, Permutation-Equivariant Reasoning, and Differentiable Matching.
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.7\linewidth]{penmot_architecture.png}
+  \caption{The PENMOT Architecture. Detection and Track features are extracted independently and then processed by a Set Transformer to learn global association contexts before Sinkhorn matching.}
+  \label{fig:architecture}
+\end{figure}
+
+\subsection{Feature Extraction}
+
+We extract two types of features for every object:
+\begin{enumerate}
+  \item \textbf{Appearance Features ($F_{app}$):} We use a ResNet-50 backbone pre-trained on ImageNet. For each detection bounding box, we crop the image region (with context padding), resize it to $224 \times 224$, and pass it through the network to obtain a 2048-dimensional vector, which is projected to 512 dimensions.
+  \item \textbf{Motion Features ($F_{motion}$):} We maintain a Kalman Filter for each track. The state vector $s = [x, y, w, h, v_x, v_y, v_w, v_h]$ and its covariance provide motion cues. We feed the motion state and a sequence of the last 10 appearance embeddings into a 2-layer LSTM (hidden dim 256) to generate a 512-dimensional track embedding.
+\end{enumerate}
+
+\subsection{Permutation-Equivariant Reasoning (Set Transformer)}
+
+To learn the compatibility between the set of current detections $D = \{d_1, \dots, d_N\}$ and the set of active tracks $T = \{t_1, \dots, t_M\}$, we use a Set Transformer with $H=8$ heads and $L=2$ layers. The architecture consists of:
+\begin{enumerate}
+  \item \textbf{Projections:} Both $D$ and $T$ are linearly projected to the transformer dimension (512).
+  \item \textbf{Self-Attention Blocks:} This allows objects within the same frame to contextually adjust their representations (e.g., resolving ambiguity between two similar-looking people nearby). This operation is permutation-equivariant.
+  $$X_{self} = \text{MultiHeadAttention}(X, X, X)$$
+  \item \textbf{Cross-Attention Blocks:} This is the core association mechanism. The detections query the tracks, and vice-versa, to find matches.
+  $$D_{out} = \text{CrossAttention}(D, T, T)$$
+  $$T_{out} = \text{CrossAttention}(T, D, D)$$
+\end{enumerate}
+
+Crucially, we avoid using positional encodings and ensure that the keys and values in our cross-attention mechanism are treated as sets, preserving the necessary symmetries for permutation-equivariant processing.
+
+\subsection{Differentiable Sinkhorn Matching}
+
+We compute a similarity cost matrix $C \in \mathbb{R}^{N \times M}$ between the transformed detection features $D_{out}$ and track features $T_{out}$:
+$$C_{ij} = - \frac{d_i \cdot t_j}{\|d_i\| \|t_j\|}$$
+We then apply the Sinkhorn algorithm for $K=20$ iterations with a temperature $\tau=0.1$. This produces a soft assignment matrix $A$ where $A_{ij} \in [0, 1]$ represents the probability that detection $i$ matches track $j$.
+
+During inference, we convert this soft assignment to a hard assignment using a greedy strategy: selecting the highest probability match greater than a threshold (0.5) and enforcing the one-to-one constraint.
+
+\subsection{Loss Functions}
+
+We train the network using a combined loss function with weights $\lambda_1=1.0$, $\lambda_2=0.5$, and $\lambda_3=0.3$:
+$$L = \lambda_1 L_{assign} + \lambda_2 L_{contrast} + \lambda_3 L_{consistency}$$
+\begin{itemize}
+  \item \textbf{Assignment Loss:} A cross-entropy loss between the predicted soft assignment matrix and the ground truth assignment (derived from Intersection-over-Union).
+  \item \textbf{Contrastive Loss:} Minimizes the distance between features of the same object identity while maximizing the distance between different identities, using implicit batch-based negatives during training.
+  \item \textbf{Consistency Loss:} Enforces temporal smoothness in the learned feature space by penalizing identity switches in the assignment:
+  $$L_{consistency} = \frac{1}{|M|} \sum_{(i,j) \in M} \mathbb{I}(ID(d_i) \neq ID(t_j))$$
+  where $M$ is the set of matched detection-track pairs.
+\end{itemize}
+
+\section{Experiments}
+
+\subsection{Experimental Setup}
+
+\begin{itemize}
+  \item \textbf{Dataset:} We use the MOT17 dataset, splitting the sequences into training (02, 04, 05, 09, 10) and validation (11, 13) sets.
+  \item \textbf{Training Details:} The model was trained for 30 epochs on a single NVIDIA GPU with a batch size of 1. In our implementation, a batch corresponds to a single video frame, meaning the model performs a gradient update step after processing the detections of each individual frame sequentially. We used the Adam optimizer with a learning rate of $1e-4$ and a StepLR scheduler. The Sinkhorn matcher used 20 iterations with $\tau=0.1$.
+  \item \textbf{Metrics:} We evaluate using standard MOT metrics: MOTA (Multi-Object Tracking Accuracy) and ID Switches (IDSW).
+\end{itemize}
+
+\subsection{Results}
+
+Table \ref{tab:results} presents our quantitative results on the validation set (MOT17-11 and MOT17-13).
+
+\begin{table}[h]
+  \caption{Tracking Performance on MOT17 Validation Set}
+  \label{tab:results}
+  \centering
+  \begin{tabular}{lcc}
+    \toprule
+    Method & MOTA & ID Switches \\
+    \midrule
+    ByteTrack (Baseline) & 80.3\% & 2196 \\
+    \textbf{PENMOT (Ours)} & \textbf{28.12\%} & \textbf{1518} \\
+    \bottomrule
+  \end{tabular}
+  \vspace{0.2cm} \\
+  \textit{Note: ByteTrack baseline values are from the official MOT17 Test set benchmark [1].}
+\end{table}
+
+It is important to note that the comparison in Table \ref{tab:results} is preliminary and affected by an evaluation split discrepancy. The baseline metrics are derived from the official MOT17 Test Set (held-out), whereas our current results are evaluated on a local validation split (Sequences 11 and 13). Consequently, this does not represent a strictly fair head-to-head comparison. We plan to resolve this in the next iteration by evaluating our final model on the official MOTChallenge server to ensure a rigorous comparison on the standard Test split.
+
+\subsection{Analysis}
+
+The results highlight a critical challenge in identity preservation. The MOTA score is heavily penalized by the 1518 ID switches. This indicates that while the model finds the objects, it fails to consistently assign the \textit{same} ID to an object over time. In crowded scenes, the Sinkhorn matching often swaps identities between adjacent frames.
+
+\textbf{Training Dynamics:}
+Our training logs show that the \texttt{Assignment Loss} decreased significantly (from ~4.1 to ~0.14) during training, indicating the model learned to match detections to tracks within the training set. However, the validation loss plateaued around 3.0-3.5, suggesting overfitting or a lack of generalization to unseen motion patterns. The high ID switch rate suggests the temporal component (LSTM or Consistency Loss) needs stronger weighting to enforce long-term identity coherence.
+
+\section{Planned Experiments}
+
+Given the high ID switch rate identified in our milestone evaluation, our immediate focus for the final project phase is to improve identity consistency. We propose the following experiments:
+
+\subsection{Loss Function Balancing}
+
+The current high ID switch rate suggests the model prioritizes immediate spatial matching over long-term temporal consistency. We plan to:
+\begin{itemize}
+  \item Increase the weight of the \textbf{Consistency Loss} ($\lambda_3$) relative to the Assignment Loss. This should force the network to learn feature representations that are invariant over longer time horizons.
+  \item Experiment with \textbf{Focal Loss} for the assignment task to address class imbalance in the matching matrix (where most entries are non-matches).
+\end{itemize}
+
+\subsection{Advanced Temporal Modeling}
+
+The current LSTM processes a history of 10 frames. We hypothesize this might be insufficient for crowded scenes with frequent occlusions. We will experiment with:
+\begin{itemize}
+  \item \textbf{Variable History Lengths:} Testing history windows of 20 and 30 frames.
+  \item \textbf{Bi-directional LSTMs:} To capture forward and backward temporal dependencies during offline processing.
+  \item \textbf{Track Rebirth:} Implementing a more robust "track revival" logic. Currently, tracks may be terminated too quickly during occlusion; we will implement a "probationary" status for lost tracks to allow re-association if they reappear within a certain window.
+\end{itemize}
+
+\subsection{Hard Negative Mining}
+
+To address the issue of identity swapping between similar-looking pedestrians, we will implement \textbf{Hard Negative Mining} in our Contrastive Loss. Instead of random negative sampling, we will specifically select the most similar non-matching tracks (those with high cosine similarity but different IDs) to compute the loss, forcing the network to learn finer-grained discriminative features.
+
+\subsection{Backbone Fine-Tuning & Regularization}
+
+Currently, the ResNet-50 backbone is frozen to prevent overfitting on the small MOT17 dataset. However, ImageNet features may not be optimal for pedestrian re-identification. To address overfitting while improving feature quality, we will experiment with:
+\begin{itemize}
+  \item \textbf{Partial Unfreezing:} Fine-tuning only the last residual block (Layer 4) of ResNet-50.
+  \item \textbf{Domain Adaptation:} Using data augmentation techniques (random erasing, color jitter) to make the appearance features more robust to lighting changes and partial occlusions.
+  \item \textbf{Dropout & Weight Decay:} Increasing the dropout rate in the Set Transformer and applying stronger weight decay to the optimizer to improve generalization to unseen sequences.
+\end{itemize}
+
+\section{Conclusion}
+
+In Milestone 2, we successfully implemented the complete end-to-end PENMOT architecture, integrating Set Transformers and Sinkhorn matching. We validated the permutation-equivariant design and the differentiability of the pipeline. While our experiments demonstrate the successful end-to-end training capability, the low MOTA score highlights a critical challenge in identity preservation. The planned experiments outlined above specifically target these limitations, setting a clear path toward a competitive end-to-end tracker for the final submission.
+
+\section*{References}
+
+\small
+
+[1] Y. Zhang et al., "ByteTrack: Multi-object tracking by associating every detection box," in \textit{Proceedings of the European Conference on Computer Vision (ECCV)}, 2022.
+
+[2] J. Lee et al., "Set transformer: A framework for attention-based permutation-invariant neural networks," in \textit{International Conference on Machine Learning (ICML)}, 2019.
+
+[3] A. Milan et al., "MOT16: A benchmark for multi-object tracking," \textit{arXiv preprint arXiv:1603.00831}, 2016.
+
+[4] M. Cuturi, "Sinkhorn distances: Lightspeed computation of optimal transport," in \textit{Advances in Neural Information Processing Systems (NIPS)}, 2013.
+
+[5] K. He, X. Zhang, S. Ren, and J. Sun, "Deep residual learning for image recognition," in \textit{Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR)}, 2016.
+
+[6] M. Zaheer et al., "Deep sets," in \textit{Advances in Neural Information Processing Systems (NIPS)}, 2017.
+
+[7] H. W. Kuhn, "The Hungarian method for the assignment problem," \textit{Naval Research Logistics Quarterly}, vol. 2, no. 1-2, pp. 83–97, 1955.
+
+\end{document}
+

@@ -1,0 +1,94 @@
+_wandb:
+    value:
+        cli_version: 0.23.0
+        e:
+            ognal5n4d7bto3lu5reaxvt89oqa4lzs:
+                codePath: train.py
+                codePathLocal: train.py
+                cpu_count: 8
+                cpu_count_logical: 16
+                cudaVersion: "13.0"
+                disk:
+                    /:
+                        total: "976223203328"
+                        used: "938045669376"
+                email: chainathanss@gmail.com
+                executable: C:\Users\Sai\Documents\Neu\PENMOT\.venv\Scripts\python.exe
+                git:
+                    commit: 02e10ebf3e3ceaf7b552ac383b14694a1b26b4c6
+                    remote: https://github.com/Srikarmk/PENMOT.git
+                gpu: NVIDIA GeForce RTX 3070 Laptop GPU
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Ampere
+                      cudaCores: 5120
+                      memoryTotal: "8589934592"
+                      name: NVIDIA GeForce RTX 3070 Laptop GPU
+                      uuid: GPU-0f46e524-dee8-48bf-528e-4af4e256e3cd
+                host: legion
+                memory:
+                    total: "34204610560"
+                os: Windows-10-10.0.19045-SP0
+                program: c:\Users\Sai\Documents\Neu\PENMOT\train.py
+                python: CPython 3.11.9
+                root: C:\Users\Sai\Documents\Neu\PENMOT
+                startedAt: "2025-12-02T18:56:56.444195Z"
+                writerId: ognal5n4d7bto3lu5reaxvt89oqa4lzs
+        m: []
+        python_version: 3.11.9
+        t:
+            "1":
+                - 1
+                - 41
+            "2":
+                - 1
+                - 41
+            "3":
+                - 13
+                - 16
+            "4": 3.11.9
+            "5": 0.23.0
+            "8":
+                - 3
+            "12": 0.23.0
+            "13": windows-amd64
+batch_size:
+    value: 1
+detection_feature_dim:
+    value: 512
+epochs:
+    value: 30
+learning_rate:
+    value: 0.0003
+num_heads:
+    value: 8
+num_layers:
+    value: 2
+optimizer:
+    value: AdamW
+scheduler:
+    value: Warmup+CosineAnnealingLR
+scheduler_T_max:
+    value: 27
+scheduler_eta_min:
+    value: 1e-06
+sinkhorn_iters:
+    value: 20
+sinkhorn_tau:
+    value: 0.1
+track_feature_dim:
+    value: 512
+transformer_dim:
+    value: 512
+w_assignment:
+    value: 1
+w_consistency:
+    value: 0.5
+w_contrastive:
+    value: 1
+warmup_epochs:
+    value: 3
+warmup_start_factor:
+    value: 0.1
+weight_decay:
+    value: 0.0001
