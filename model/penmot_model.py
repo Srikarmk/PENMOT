@@ -379,6 +379,7 @@ import torch
 import torch.nn as nn
 import sys
 import os
+import numpy as np
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
@@ -430,8 +431,14 @@ class PENMOT(nn.Module):
         )
 
         self.matcher = SinkhornMatcher(
-            n_iters=20,
-            tau=0.05,
+            n_iters=sinkhorn_iters,
+            tau=sinkhorn_tau,
+            hard_assignment=False
+        )
+
+        self.inference_matcher = SinkhornMatcher(
+            n_iters=sinkhorn_iters,
+            tau=sinkhorn_tau,
             hard_assignment=True
         )
 
@@ -458,7 +465,32 @@ class PENMOT(nn.Module):
     def extract_track_features(self, track_ids=None):
         return self.track_manager.get_track_features(track_ids)
 
-    def forward(self, detection_features, track_features):
+    def compute_motion_cost(self, detection_boxes, track_boxes):
+        det_boxes_np = detection_boxes.cpu().numpy() if torch.is_tensor(detection_boxes) else detection_boxes
+        track_boxes_np = track_boxes.cpu().numpy() if torch.is_tensor(track_boxes) else track_boxes
+
+        motion_cost = np.zeros((len(det_boxes_np), len(track_boxes_np)))
+
+        for i, det_box in enumerate(det_boxes_np):
+            for j, track_box in enumerate(track_boxes_np):
+                x1 = max(det_box[0], track_box[0])
+                y1 = max(det_box[1], track_box[1])
+                x2 = min(det_box[2], track_box[2])
+                y2 = min(det_box[3], track_box[3])
+
+                inter = max(0, x2 - x1) * max(0, y2 - y1)
+                area1 = (det_box[2] - det_box[0]) * (det_box[3] - det_box[1])
+                area2 = (track_box[2] - track_box[0]) * (track_box[3] - track_box[1])
+                union = area1 + area2 - inter
+
+                iou = inter / (union + 1e-8)
+                motion_cost[i, j] = iou
+
+        return torch.tensor(motion_cost, dtype=torch.float32,
+                            device=detection_boxes.device if torch.is_tensor(detection_boxes) else torch.device('cpu'))
+
+    def forward(self, detection_features, track_features, detection_boxes=None, track_boxes=None,
+                motion_weight=0.3, use_hard_assignment=None):
         if len(detection_features) == 0 or len(track_features) == 0:
             return torch.zeros((len(detection_features), len(track_features)))
 
@@ -468,9 +500,20 @@ class PENMOT(nn.Module):
         det_out = self.detection_transformer(det_proj, track_proj)
         track_out = self.track_transformer(track_proj, det_proj)
 
-        cost_matrix = -torch.mm(det_out, track_out.t())
+        appearance_similarity = torch.mm(det_out, track_out.t())
 
-        assignment = self.matcher(cost_matrix)
+        if detection_boxes is not None and track_boxes is not None:
+            motion_similarity = self.compute_motion_cost(detection_boxes, track_boxes)
+            combined_similarity = (1 - motion_weight) * appearance_similarity + motion_weight * motion_similarity
+            cost_matrix = -combined_similarity
+        else:
+            cost_matrix = -appearance_similarity
+
+        if use_hard_assignment is None:
+            use_hard_assignment = not self.training
+
+        matcher = self.inference_matcher if use_hard_assignment else self.matcher
+        assignment = matcher(cost_matrix)
 
         return assignment
 
@@ -501,20 +544,16 @@ class PENMOT(nn.Module):
             new_track_ids.append(track_id)
         return new_track_ids
 
-    def track_frame(self, img, boxes):
-        print(f"[TRACK_FRAME] Called with {len(boxes)} boxes")
-
+    def track_frame(self, img, boxes, motion_weight=0.3):
         if len(boxes) == 0:
             self.track_manager.predict_tracks()
             return [], []
 
         valid_boxes = []
-        valid_indices = []
         for i, box in enumerate(boxes):
             x1, y1, x2, y2 = box
             if x2 > x1 and y2 > y1:
                 valid_boxes.append(box)
-                valid_indices.append(i)
 
         if len(valid_boxes) == 0:
             return [], []
@@ -523,12 +562,8 @@ class PENMOT(nn.Module):
         valid_boxes_np = valid_boxes.detach().cpu().numpy()
 
         detection_features = self.extract_detection_features(img, valid_boxes)
-        print(f"[TRACK_FRAME] Extracted {len(detection_features)} detection features")
-
-        print(f"[TRACK_FRAME] Total tracks in manager: {len(self.track_manager.tracks)}")
 
         if len(self.track_manager.tracks) == 0:
-            print(f"[TRACK_FRAME] No existing tracks, creating new ones")
             track_ids = []
             for i in range(len(valid_boxes)):
                 box = valid_boxes_np[i]
@@ -540,10 +575,7 @@ class PENMOT(nn.Module):
         confirmed_tracks = {tid: t for tid, t in self.track_manager.tracks.items()
                             if t.is_confirmed(min_hits=1)}
 
-        print(f"[TRACK_FRAME] Confirmed tracks: {len(confirmed_tracks)}")
-
         if len(confirmed_tracks) == 0:
-            print(f"[TRACK_FRAME] No confirmed tracks, creating new ones")
             track_ids = []
             for i in range(len(valid_boxes)):
                 box = valid_boxes_np[i]
@@ -553,12 +585,17 @@ class PENMOT(nn.Module):
             return track_ids, detection_features
 
         active_track_ids = list(confirmed_tracks.keys())
+
+        track_boxes_list = []
+        for tid in active_track_ids:
+            predicted_box = self.track_manager.tracks[tid].kalman.get_bbox()
+            track_boxes_list.append(predicted_box)
+
+        track_boxes = torch.tensor(np.array(track_boxes_list), dtype=torch.float32, device=valid_boxes.device)
+
         track_features, feature_track_ids = self.extract_track_features(active_track_ids)
 
-        print(f"[TRACK_FRAME] Extracted {len(track_features)} track features from {len(active_track_ids)} tracks")
-
         if len(track_features) == 0:
-            print(f"[TRACK_FRAME] No track features, creating new tracks")
             track_ids = []
             for i in range(len(valid_boxes)):
                 box = valid_boxes_np[i]
@@ -567,13 +604,12 @@ class PENMOT(nn.Module):
                 track_ids.append(track_id)
             return track_ids, detection_features
 
-        print(f"[TRACK_FRAME] Computing assignment matrix...")
-        assignment = self.forward(detection_features, track_features)
-        print(f"[TRACK_FRAME] Assignment shape: {assignment.shape}")
-        print(f"[TRACK_FRAME] Assignment:\n{assignment}")
+        assignment = self.forward(detection_features, track_features,
+                                  valid_boxes, track_boxes,
+                                  motion_weight=motion_weight,
+                                  use_hard_assignment=True)
 
         matches = (assignment > 0.5).nonzero(as_tuple=False)
-        print(f"[TRACK_FRAME] Found {len(matches)} matches")
 
         assigned_track_ids = [-1] * len(valid_boxes)
 
@@ -589,16 +625,12 @@ class PENMOT(nn.Module):
                 appearance = detection_features[det_idx].detach().cpu().numpy()
                 self.track_manager.update_track(track_id, box, appearance)
 
-        print(f"[TRACK_FRAME] Assigned {sum(1 for x in assigned_track_ids if x != -1)} detections to existing tracks")
-
         for det_idx in range(len(valid_boxes)):
             if assigned_track_ids[det_idx] == -1:
                 box = valid_boxes_np[det_idx]
                 appearance = detection_features[det_idx].detach().cpu().numpy()
                 track_id = self.track_manager.init_track(box, appearance)
                 assigned_track_ids[det_idx] = track_id
-
-        print(f"[TRACK_FRAME] Created {sum(1 for x in assigned_track_ids if x > max(feature_track_ids))} new tracks")
 
         self.track_manager.remove_deleted_tracks(max_age=30)
 

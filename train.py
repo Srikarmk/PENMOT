@@ -78,7 +78,10 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch):
         img = img.to(device)
         boxes = boxes.to(device)
 
-        detection_features = model.extract_detection_features(img, boxes)
+        detection_features = model.detection_encoder(img, boxes)
+
+        if len(detection_features) != len(boxes):
+            continue
 
         if len(detection_features) == 0:
             continue
@@ -101,13 +104,25 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch):
             sequence_history[seq_name]['prev_ids'] = ids
             continue
 
+        if len(detection_features) != len(boxes) or len(prev_features) != len(prev_boxes):
+            sequence_history[seq_name]['prev_boxes'] = boxes.detach()
+            sequence_history[seq_name]['prev_detections'] = detection_features.detach()
+            sequence_history[seq_name]['prev_ids'] = ids
+            continue
+
         det_proj = model.detection_projection(detection_features)
         track_proj = model.track_projection(prev_features)
 
         det_out = model.detection_transformer(det_proj, track_proj)
         track_out = model.track_transformer(track_proj, det_proj)
 
-        cost_matrix = -torch.mm(det_out, track_out.t())
+        appearance_similarity = torch.mm(det_out, track_out.t())
+
+        motion_similarity = model.compute_motion_cost(boxes, prev_boxes)
+
+        motion_weight = 0.3
+        combined_similarity = (1 - motion_weight) * appearance_similarity + motion_weight * motion_similarity
+        cost_matrix = -combined_similarity
 
         pred_assignment = model.matcher(cost_matrix)
 
@@ -193,7 +208,10 @@ def validate(model, val_loader, criterion, device):
             img = img.to(device)
             boxes = boxes.to(device)
 
-            detection_features = model.extract_detection_features(img, boxes)
+            detection_features = model.detection_encoder(img, boxes)
+
+            if len(detection_features) != len(boxes):
+                continue
 
             if len(detection_features) == 0:
                 continue
@@ -211,6 +229,12 @@ def validate(model, val_loader, criterion, device):
             prev_boxes = prev_data['prev_boxes']
 
             if len(prev_features) == 0:
+                sequence_history[seq_name]['prev_boxes'] = boxes
+                sequence_history[seq_name]['prev_detections'] = detection_features
+                sequence_history[seq_name]['prev_ids'] = ids
+                continue
+
+            if len(detection_features) != len(boxes) or len(prev_features) != len(prev_boxes):
                 sequence_history[seq_name]['prev_boxes'] = boxes
                 sequence_history[seq_name]['prev_detections'] = detection_features
                 sequence_history[seq_name]['prev_ids'] = ids
